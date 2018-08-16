@@ -1,13 +1,15 @@
 # Bismuth Faucet Payout App
-# Version 1.00
-# Date 28/07/2017
-# Copyright Maccaspacca 2017
-# Copyright Hclivess 2016 to 2017
+# Version 2.00
+# Date 16/08/2018
+# Copyright Maccaspacca 2017 to 2018
+# Copyright The Bismuth Foundation 2016 to 2018
 # Author Maccaspacca
 
-from Crypto.Signature import PKCS1_v1_5
-from Crypto.Hash import SHA
-import base64, time, sqlite3, keys, sys
+from Cryptodome.PublicKey import RSA
+from Cryptodome.Signature import PKCS1_v1_5
+from Cryptodome.Hash import SHA
+
+import base64, time, sqlite3, sys, fprocs, json, platform, os
 
 import logging
 import configparser as cp
@@ -19,11 +21,52 @@ logging.basicConfig(level=logging.INFO,
 logging.info("logging initiated")
 
 config = cp.ConfigParser()
-config.read("faucet.ini")
+config.read("faucetconfig.ini")
 fpath = config.get('My Faucet','mydbpath')
 frate = float(config.get('My Faucet','myrate'))
+port = config.get('My Faucet', 'nodeport')
+ip = config.get('My Faucet', 'nodeip')
+wallet = config.get('My Bismuth', 'mywallet')
 
-(key, private_key_readable, public_key_readable, public_key_hashed, address) = keys.read()
+logging.info("Config file read completed")
+config = None
+
+my_os = platform.system()
+my_os = my_os.lower()
+
+myversion = "2.0.0" # hardcode the version
+
+if "linux" in my_os:
+	wallet = os.path.expanduser('{}'.format(wallet))
+elif "windows" in my_os:
+	pass
+else: # if its not windows then probably a linux or unix variant
+	pass
+	
+myversion = "2.0.0" # hardcode the version
+
+
+def keys_load_new(wallet_file=wallet):
+    # import keys
+
+    with open (wallet_file, 'r') as wallet_file:
+        wallet_dict = json.load (wallet_file)
+
+    private_key_readable = wallet_dict['Private Key']
+    public_key_readable = wallet_dict['Public Key']
+    address = wallet_dict['Address']
+
+    key = RSA.importKey(private_key_readable)
+ 
+    # public_key_readable = str(key.publickey().exportKey())
+    if (len(public_key_readable)) != 271 and (len(public_key_readable)) != 799:
+        raise ValueError("Invalid public key length: {}".format(len(public_key_readable)))
+
+    public_key_hashed = base64.b64encode(public_key_readable.encode('utf-8'))
+
+    return key, public_key_readable, private_key_readable, public_key_hashed, address
+
+(key, private_key_readable, public_key_readable, public_key_hashed, address) = keys_load_new(wallet)
 
 def payees():
 	pay = sqlite3.connect(fpath)
@@ -45,94 +88,62 @@ def dopaid():
 	
 def payme():
 
-	#get balance
-	mempool = sqlite3.connect('mempool.db')
-	mempool.text_factory = str
-	m = mempool.cursor()
-	m.execute("SELECT sum(amount) FROM transactions WHERE address = ?;", (address,))
-	debit_mempool = m.fetchone()[0]
-	mempool.close()
-	if debit_mempool == None:
-		debit_mempool = 0
-
-	conn = sqlite3.connect('static/ledger.db')
-	conn.text_factory = str
-	c = conn.cursor()
-	c.execute("SELECT sum(amount) FROM transactions WHERE recipient = ?;", (address,))
-	credit = c.fetchone()[0]
-	c.execute("SELECT sum(amount) FROM transactions WHERE address = ?;", (address,))
-	debit = c.fetchone()[0]
-	c.execute("SELECT sum(fee) FROM transactions WHERE address = ?;", (address,))
-	fees = c.fetchone()[0]
-	c.execute("SELECT sum(reward) FROM transactions WHERE address = ?;", (address,))
-	rewards = c.fetchone()[0]
-	c.execute("SELECT MAX(block_height) FROM transactions")
-	bl_height = c.fetchone()[0]
-
-	if debit == None:
-		debit = 0
-	if fees == None:
-		fees = 0
-	if rewards == None:
-		rewards = 0
-	if credit == None:
-		credit = 0
-	balance = credit - debit - fees + rewards - debit_mempool
-	logging.info("Transaction address: {}".format(address))
-	logging.info("Transaction address balance: {}".format(balance))
-	#get balance
-
 	amount_input = frate
-	keep_input = 0
-	openfield_input = ""
-	fee = '%.8f' % float(0.01 + (float(amount_input) * 0.001) + (float(len(openfield_input)) / 100000) + (float(keep_input) / 10))  # 0.1% + 0.01 dust
+	operation_input = 0
+	openfield_input = "faucet"
+	fee = '%.8f' % float(0.01 + (float(len(openfield_input)) / 100000) + (float(operation_input) / 10))  # 0.1% + 0.01 dust
 
 	paylist = []
 	paylist = payees()
-
+	
 	if paylist:
 
 		try:
 
 			for d in paylist:
-				recipient_input = str(d[1])
-				print("{} is being be paid {} BIS, with {} fee".format(recipient_input,str(amount_input),str(fee)))
-				logging.info("{} is being be paid {} BIS, with {} fee".format(recipient_input,str(amount_input),str(fee)))
-				timestamp = '%.2f' % time.time()
-				transaction = (str(timestamp), str(address), str(recipient_input), '%.8f' % float(amount_input), str(keep_input), str(openfield_input)) #this is signed
-				#print transaction
+				d_check = fprocs.balcheck(address,ip,port,fpath,frate)				
+				if d_check[0]:
+					balance = d_check[1]
+					recipient_input = str(d[1])
+					print("{} is being be paid {} BIS, with {} fee".format(recipient_input,str(amount_input),str(fee)))
+					logging.info("{} is being be paid {} BIS, with {} fee".format(recipient_input,str(amount_input),str(fee)))
+					timestamp = '%.2f' % time.time()
+				
+					transaction = (str(timestamp), str(address), str(recipient_input), '%.8f' % float(amount_input), str(operation_input), str(openfield_input))  # this is signed
+					#print(str(transaction).encode("utf-8"))
 
-				h = SHA.new(str(transaction).encode("utf-8"))
-				signer = PKCS1_v1_5.new(key)
-				signature = signer.sign(h)
-				signature_enc = base64.b64encode(signature)
-				logging.info("Encoded Signature: {}".format(signature_enc.decode("utf-8")))
+					h = SHA.new(str(transaction).encode("utf-8"))
+					signer = PKCS1_v1_5.new(key)
+					signature = signer.sign(h)
+					signature_enc = base64.b64encode(signature)
+					txid = signature_enc[:56]
+					mytxid = txid.decode("utf-8")
+					logging.info("Transaction ID: {}".format(mytxid))
+					
+					verifier = PKCS1_v1_5.new(key)
+					if verifier.verify(h, signature):
+						if float(amount_input) < 0:
+							logging.info("Signature OK, but cannot use negative amounts")
 
-				verifier = PKCS1_v1_5.new(key)
-				if verifier.verify(h, signature) == True:
-					if float(amount_input) < 0:
-						logging.info("Signature OK, but cannot use negative amounts")
+						elif (float(amount_input) + float(fee)) > float(balance):
+							logging.info("Payout: Sending more than owned")
 
-					elif (float(amount_input) > float(balance)):
-						logging.info("Mempool: Sending more than owned")
+						else:
+							logging.info("The signature is valid, proceeding to send the transaction to node")
+							tx_submit = (str(timestamp), str(address), str(recipient_input), '%.8f' % float(amount_input), str(signature_enc.decode("utf-8")), str(public_key_hashed), str(operation_input), str(openfield_input)) #float kept for compatibility
+							#logging.info(tx_submit)
+							
+							reply = fprocs.tx_send(ip,port,tx_submit)
+							
+							logging.info(reply)
+							logging.info("Transaction sent {} to node".format(mytxid))
 
 					else:
-						logging.info("The signature is valid, proceeding to save transaction to mempool")
-
-						mempool = sqlite3.connect('mempool.db')
-						mempool.text_factory = str
-						m = mempool.cursor()
-
-						m.execute("INSERT INTO transactions VALUES (?,?,?,?,?,?,?,?)",(str(timestamp), str(address), str(recipient_input), '%.8f' % float(amount_input),str(signature_enc.decode("utf-8")), str(public_key_hashed), str(keep_input), str(openfield_input)))
-						mempool.commit()  # Save (commit) the changes
-						mempool.close()
-						logging.info("Mempool updated with a received transaction")
-						
-					
-						#refresh() experimentally disabled
+						logging.info("Invalid signature")
+					time.sleep(1)
+					#enter transaction end
 				else:
-					logging.info("Invalid signature")
-				#enter transaction end
+					logging.info("Not enough funds")
 
 			dopaid()
 			return True
@@ -158,6 +169,3 @@ def updateme():
 
 if __name__ == "__main__":
 	updateme()
-	
-		
-	

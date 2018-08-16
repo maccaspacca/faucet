@@ -1,40 +1,16 @@
 # Bismuth Faucet Main App
-# Version 1.00
-# Date 28/07/2017
-# Copyright Maccaspacca 2017
-# Copyright Hclivess 2016 to 2017
+# Version 2.00
+# Date 16/08/2018
+# Copyright Maccaspacca 2017 to 2018
+# Copyright The Bismuth Foundation 2016 to 2018
 # Author Maccaspacca
 
 from bottle import route, run, get, post, request, static_file
-import sqlite3
-import time
-import re
-import os
-import base64
-import hashlib
-import logging
-import random
-import platform
-import string
+from random import getrandbits
+import sqlite3, time, re, os, logging, random, platform, shutil, connections, socks, fprocs, socket, sys
 from captcha.image import ImageCaptcha
-import shutil
 
-try:
-    # For Python 3.0 and later
-	import configparser as cp
-except ImportError:
-    # Fall back to Python 2's ConfigParser
-	import ConfigParser as cp
-
-# globals
-global my_os
-global bis_root
-global bis_path
-global fau_root
-global myblocked
-global myrate
-global bis_mem
-global pubpath
+import configparser as cp
 
 logging.basicConfig(level=logging.INFO, 
                     filename='faucet.log', # log to this file
@@ -42,39 +18,71 @@ logging.basicConfig(level=logging.INFO,
 
 logging.info("logging initiated")
 
+try:
+	faucet_port = int(sys.argv[1])
+except Exception as e:
+	faucet_port = 8183
+	
+print("Faucet port is {}".format(str(faucet_port)))
+
 config = cp.ConfigParser()
 config.read('faucetconfig.ini')
-# config.readfp(open(r'faucetconfig.ini'))
+
 logging.info("Reading config file.....")
-bis_root = config.get('My Bismuth', 'dbpath')
-bis_path = config.get('My Bismuth', 'bispath')
 myrate = int(config.get('My Faucet', 'myrate'))
 myblocked = config.get('My Faucet', 'myblocked')
 fau_root = config.get('My Faucet', 'mydbpath')
+port = config.get('My Faucet', 'nodeport')
+ip = config.get('My Faucet', 'nodeip')
+max_ip_visit = int(config.get('My Faucet', 'maxvisits')) # maximum payouts per IP or hostname - need code to check hostname and store in requesters along with IP
+valid_chars = config.get('My Faucet', 'v_chars')
+capt_length = int(config.get('My Faucet', 'c_length'))
+
+c_list = list(valid_chars)
+
+c_str = ""
+
+for cs in c_list:
+
+	c_str = c_str + cs + ","
+	
+c_str = c_str[:-1]
+
+# print(c_str)
+
+if config.get('My Faucet', 'bestrict') == "true":
+	f_strict = True
+	logging.info("Strict Mode is ON")
+	print("Strict Mode is ON")
+else:
+	f_strict = False
+	logging.info("Strict Mode is OFF")
+	print("Strict Mode is OFF")
+	
+spamtime = int(config.get('My Faucet', 'spamtime'))
+address = config.get('My Faucet', 'faddy')
+
 logging.info("Config file read completed")
 config = None
 
 my_os = platform.system()
 my_os = my_os.lower()
 
+myversion = "2.0.0" # hardcode the version
+
 if "linux" in my_os:
 	fau_root = os.path.expanduser('{}'.format(fau_root))
-	bis_root = os.path.expanduser('{}'.format(bis_root))
-	bis_path = os.path.expanduser('{}'.format(bis_path))
 elif "windows" in my_os:
 	pass
 else: # if its not windows then probably a linux or unix variant
 	pass
-
-bis_mem = "{}mempool.db".format(bis_path)
-pubpath = "{}pubkey.der".format(bis_path)
 
 print("Faucet path = {}".format(fau_root))
 
 mip = sqlite3.connect(':memory:')
 mip.text_factory = str
 p = mip.cursor()
-p.execute("CREATE TABLE IF NOT EXISTS sessions (timestamp, custip, captcha)")
+p.execute("CREATE TABLE IF NOT EXISTS sessions (timestamp, custip, captcha, png)")
 mip.commit()
 
 def purge(pattern):
@@ -83,9 +91,9 @@ def purge(pattern):
 		os.remove(f)
 
 # def getcaptcha(length = 6, char = string.ascii_uppercase + string.digits + string.ascii_lowercase ):
-def getcaptcha(length = 10, char = string.digits):
+def getcaptcha(length = capt_length, char = valid_chars):
 
-	return ''.join(random.choice( char) for x in range(length))
+	return ''.join(random.choice(char) for x in range(length))
 
 def myoginfo():
 
@@ -93,7 +101,6 @@ def myoginfo():
 
 	doconfig = cp.ConfigParser()
 	doconfig.read('faucetconfig.ini')
-	# doconfig.readfp(open(r'faucetconfig.ini'))
 	logging.info("Reading config file.....")
 	doda.append(doconfig.get('My Oginfo', 'og_title'))
 	doda.append(doconfig.get('My Oginfo', 'og_description'))
@@ -110,56 +117,29 @@ def myoginfo():
 def checkstart():
 
 	if not os.path.exists(fau_root):
-		# create empty miners database
+		# create empty faucet.db
 		logging.info("Faucet DB: Create New as none exists")
 		mlist = sqlite3.connect(fau_root)
 		mlist.text_factory = str
 		m = mlist.cursor()
-		m.execute("CREATE TABLE IF NOT EXISTS requesters (timestamp, addy, amount, paid, custip)")
+		m.execute("CREATE TABLE IF NOT EXISTS requesters (timestamp, addy, amount, paid, custip, custhost)")
 		mlist.commit()
 		mlist.close()
 		# create empty faucet.db
 
 def balcheck():
 
-	with open(pubpath, 'r') as f:
-		public_key_readable = f.read()
-	public_key_hashed = base64.b64encode(public_key_readable.encode("utf-8"))
-	address = hashlib.sha224(public_key_readable.encode("utf-8")).hexdigest()
-	f.close()
-
-	mempool = sqlite3.connect(bis_mem)
-	mempool.text_factory = str
-	m = mempool.cursor()
-	m.execute("SELECT sum(amount) FROM transactions WHERE address = ?;", (address,))
-	debit_mempool = m.fetchone()[0]
-	mempool.close()
-	if debit_mempool == None:
-		debit_mempool = 0
-
-	conn = sqlite3.connect(bis_root)
-	conn.text_factory = str
-	c = conn.cursor()
-	c.execute("SELECT sum(amount) FROM transactions WHERE recipient = ?;", (address,))
-	credit = c.fetchone()[0]
-	c.execute("SELECT sum(amount) FROM transactions WHERE address = ?;", (address,))
-	debit = c.fetchone()[0]
-	c.execute("SELECT sum(fee) FROM transactions WHERE address = ?;", (address,))
-	fees = c.fetchone()[0]
-	c.execute("SELECT sum(reward) FROM transactions WHERE address = ?;", (address,))
-	rewards = c.fetchone()[0]
-	c.execute("SELECT MAX(block_height) FROM transactions")
-	bl_height = c.fetchone()[0]
-
-	if debit == None:
-		debit = 0
-	if fees == None:
-		fees = 0
-	if rewards == None:
-		rewards = 0
-	if credit == None:
-		credit = 0
-	tbal = credit - debit - fees + rewards - debit_mempool
+	s = socks.socksocket()
+	s.settimeout(10)
+	s.connect((ip, int(port)))
+	connections.send(s, "balanceget", 10)
+	connections.send(s, address, 10)
+	mbal_get = connections.receive(s, 10)
+	s.close()
+	
+	#print ("Current balance: {}".format(mbal_get[0]))
+	
+	tbal = float(mbal_get[0])
 	
 	pay = sqlite3.connect(fau_root)
 	pay.text_factory = str
@@ -180,10 +160,10 @@ def balcheck():
 		return False
 
 
-def iplog(tempip,tempcaptcha):
+def iplog(tempip,tempcaptcha,pngname):
 	
 	temptime = time.time()
-	p.execute("INSERT INTO sessions VALUES (?,?,?)", (temptime, str(tempip), tempcaptcha))
+	p.execute("INSERT INTO sessions VALUES (?,?,?,?)", (temptime, str(tempip), tempcaptcha, pngname))
 	mip.commit()
 
 # get faucet balance
@@ -202,7 +182,7 @@ def ipcheck(tempip):
 		# print(t2)
 		t3 = t1 - t2
 		# print(t3)
-		if t3 < 300:
+		if t3 < spamtime:
 			return False
 		else:
 			return True
@@ -211,22 +191,23 @@ def getcp(tempip):
 
 	p.execute("SELECT * FROM sessions WHERE custip = ? ORDER BY timestamp DESC LIMIT 1;", (tempip,))
 	checkcp = p.fetchall()
+	#print(checkcp)
 	
 	cp = str(checkcp[0][2])
+	pn = str(checkcp[0][3])
 	
-	return cp
+	return cp,pn
 
 def getlinks():
 
 	theselinks = []
 	doconfig = cp.ConfigParser()
-	# doconfig.readfp(open(r'faucetconfig.ini'))
 	doconfig.read('faucetconfig.ini')
 	logging.info("Reading config file for web links.....")
 	theselinks.append(doconfig.get('My Bismuth', 'website'))
 	theselinks.append(doconfig.get('My Bismuth', 'wallet'))
 	theselinks.append(doconfig.get('My Bismuth', 'source'))
-	theselinks.append(doconfig.get('My Bismuth', 'slack'))
+	theselinks.append(doconfig.get('My Bismuth', 'discord'))
 	theselinks.append(doconfig.get('My Bismuth', 'explorer'))
 	theselinks.append(doconfig.get('My Bismuth', 'bct'))
 
@@ -260,7 +241,7 @@ def my_head(bo):
 	mhead.append('<style>\n')
 	mhead.append('h1, h2, p, li, td, label {font-family: Verdana;}\n')
 	mhead.append('body {font-size: 100%;}\n')
-	mhead.append('ul {list-style-type: none;margin: 0;padding: 0;overflow: hidden;background-color: #333;}\n')
+	mhead.append('ul {list-style-type: none;margin: 0;padding: 0;overflow: hidden;background-color: #600080;}\n')
 	mhead.append('li {float: left;}\n')
 	mhead.append('li a {display: inline-block;color: white;text-align: center;padding: 14px 16px;text-decoration: none;}\n')
 	mhead.append('li a:hover {background-color: #111;}\n')
@@ -278,7 +259,7 @@ def my_head(bo):
 	mhead.append('<meta property="og:locale" content="en_US" />\n')
 	mhead.append('<meta property="xbm:version" content="201" />\n')
 	mhead.append('<meta name="description" content="{}" />\n'.format(dado[1]))
-	mhead.append('<title>{}</title>\n'.format(dado[0]))
+	mhead.append('<title>{} v{}</title>\n'.format(dado[0],myversion))
 	mhead.append('</head>\n')
 	mhead.append('<body background="static/explorer_bg.png">\n')
 	mhead.append('<center>\n')
@@ -305,10 +286,15 @@ def server_static(filename):
 @get('/')
 def home_form():
 
-	print(balcheck())
+	#print(balcheck())
 	myip = request.environ.get('REMOTE_ADDR')
+	
+	myhost = socket.gethostbyaddr(myip)
+	# print(myhost[0])
+	
 	currcaptcha = getcaptcha()
-	iplog(myip,currcaptcha)
+	seed = ('%0x' % getrandbits(64))
+	iplog(myip,currcaptcha,seed)
 	
 	initial = my_head('table, th, td {border: 1px solid black;border-collapse: collapse;padding: 5px;-webkit-column-width: 100%;-moz-column-width: 100%;column-width: 100%;}')
 
@@ -316,22 +302,26 @@ def home_form():
 	initial.append('<td align="center" style="border:hidden;">\n')
 	initial.append('<h1>Bismuth Cryptocurrency</h1>\n')
 	
-	if balcheck():
+	if ipcheck(myip):
 	
-		if ipcheck(myip):
-			# print("OK")
-
+		if fprocs.balcheck(address,ip,port,fau_root,myrate)[0]:
+	
 			purge("static/*{}.png".format(myip))
 			image = ImageCaptcha()
 			data = image.generate(currcaptcha)
-			image.write(currcaptcha, '{}{}.png'.format(currcaptcha,myip))
-			src = "{}{}.png".format(currcaptcha,myip)
+			image.write(currcaptcha, '{}{}.png'.format(seed,myip))
+			src = "{}{}.png".format(seed,myip)
 			dest = "static"
 			shutil.move(src,dest)
 
 			initial.append('<h2>Welcome to the Bismuth Faucet</h2>\n')
+			# initial.append('<p>Hello {} ({})<p>\n'.format(myhost[0],myip))
 			initial.append('<p>Enter your details below and click submit</p>\n')
-			initial.append('<p><b>The payout is {} BIS every {} hours</b></p>\n'.format(str(myrate),str(myblocked)))
+			initial.append('<p>Valid characters are {}</p>\n'.format(c_str))
+			if f_strict:
+				initial.append('<p><b>One payout per address or IP</b></p>\n'.format(str(myrate),str(myblocked)))
+			else:
+				initial.append('<p><b>The payout is {} BIS every {} hours</b></p>\n'.format(str(myrate),str(myblocked)))
 			initial.append('<p></p>\n')
 			initial.append('<p><img src="static/{}" alt="captcha"></p>\n'.format(src))
 			initial.append('</td>\n')
@@ -343,31 +333,32 @@ def home_form():
 			initial.append('<tr><th align="left"><label for="Submit Request">3. Click Submit to claim Bismuth</label></th><td><button id="Submit" name="Submit">Submit</button></td></tr>\n')
 			initial.append('</table>\n')
 			initial.append('</form>\n')
-			initial.append('<p>&copy; Copyright: Maccaspacca and HCLivess, 2017</p>')
+			initial.append('<p>&copy; Copyright: Maccaspacca and The Bismuth Foundation, 2018</p>')
 			initial.append('</center>\n')
 			initial.append('</body>\n')
 			initial.append('</html>')
-		
+			
 		else:
-		
 			initial.append('<h2>Welcome to the Bismuth Faucet</h2>\n')
 			initial.append('<p></p>\n')
-			initial.append('<p><b>Too Many Visits - come back later</b></p>\n')
+			initial.append('<p><b>Not enough BIS in the faucet - come back later</b></p>\n')
 			initial.append('<p></p>\n')
-			initial.append('<p>&copy; Copyright: Maccaspacca and HCLivess, 2017</p>')
+			initial.append('<p>&copy; Copyright: Maccaspacca and The Bismuth Foundation, 2018</p>')
 			initial.append('</center>\n')
 			initial.append('</body>\n')
 			initial.append('</html>')
-			# print("Not OK")
+		
 	else:
+	
 		initial.append('<h2>Welcome to the Bismuth Faucet</h2>\n')
 		initial.append('<p></p>\n')
-		initial.append('<p><b>Not enough BIS in the faucet - come back later</b></p>\n')
+		initial.append('<p><b>Spam protection started, please come back later</b></p>\n')
 		initial.append('<p></p>\n')
-		initial.append('<p>&copy; Copyright: Maccaspacca and HCLivess, 2017</p>')
+		initial.append('<p>&copy; Copyright: Maccaspacca and The Bismuth Foundation, 2018</p>')
 		initial.append('</center>\n')
 		initial.append('</body>\n')
 		initial.append('</html>')
+		# print("Not OK")
 
 	starter = "" + str(''.join(initial))
 
@@ -377,7 +368,13 @@ def home_form():
 def home_query():
 	
 	myip = request.environ.get('REMOTE_ADDR')
-	currcaptcha = getcp(myip)
+	
+	myhost = socket.gethostbyaddr(myip)
+	# print(myhost[0])
+	
+	t_cap = getcp(myip)
+	currcaptcha = t_cap[0]
+	seed = t_cap[1]
 	
 	myblock = request.forms.get('addy')
 	myanswer = request.forms.get('captcha')
@@ -391,7 +388,6 @@ def home_query():
 	replot.append('<h2>Welcome to the Bismuth Faucet</h2>\n')
 
 	if ipcheck(myip):
-		# print("OK")	
 
 		if myanswer == currcaptcha:
 					
@@ -427,28 +423,45 @@ def home_query():
 				faucet.close()
 				
 				if checkit:
-					# print("checkit")
-					old = float(checkit[0][0])
-					new = float(thistime)
-					ruok = float(myblocked) * 3600
-					if ruok >= (new - old):
-						myresponse = "<p>{}</p><p>Too early - try later</p>".format(myblock)
+					if f_strict:
+						myresponse = "<p>{}</p><p>Sorry - only one payment per Bismuth address</p>".format(myblock)
 						try:
-							os.remove("static/{}{}.png".format(currcaptcha,myip))
+							os.remove("static/{}{}.png".format(seed,myip))
 						except Exception as e:
 							pass
 						goodtogo = False
+					else:
+						# print("checkit")
+						old = float(checkit[0][0])
+						new = float(thistime)
+						ruok = float(myblocked) * 3600
+						if ruok >= (new - old):
+							myresponse = "<p>{}</p><p>Too early - try later</p>".format(myblock)
+							try:
+								os.remove("static/{}{}.png".format(seed,myip))
+							except Exception as e:
+								pass
+							goodtogo = False
+				
 				if checkip and goodtogo:
-					old = float(checkip[0][0])
-					new = float(thistime)
-					ruok = float(myblocked) * 3600
-					if ruok >= (new - old):
-						myresponse = "<p>{}</p><p>Too early - try later</p>".format(myip)
+					if f_strict and len(checkip) > max_ip_visit:
+						myresponse = "<p>{}</p><p>Sorry - only {} payment(s) per host or IP</p>".format(myblock,str(max_ip_visit))
 						try:
-							os.remove("static/{}{}.png".format(currcaptcha,myip))
+							os.remove("static/{}{}.png".format(seed,myip))
 						except Exception as e:
 							pass
 						goodtogo = False
+					else:					
+						old = float(checkip[0][0])
+						new = float(thistime)
+						ruok = float(myblocked) * 3600
+						if ruok >= (new - old):
+							myresponse = "<p>{}</p><p>Too early - try later</p>".format(myip)
+							try:
+								os.remove("static/{}{}.png".format(seed,myip))
+							except Exception as e:
+								pass
+							goodtogo = False
 			
 		else:
 			myresponse = "<p>Error</p><p>Invalid Captcha - try again</p>"
@@ -461,18 +474,18 @@ def home_query():
 			faucet.isolation_level = None
 			faucet.text_factory = str
 			f = faucet.cursor()
-			f.execute('INSERT INTO requesters VALUES (?,?,?,?,?)', (thistime, myblock, str(1), "No", str(myip)))
+			f.execute('INSERT INTO requesters VALUES (?,?,?,?,?,?)', (thistime, myblock, str(1), "No", str(myip), str(myhost[0])))
 			faucet.commit()
 			f.close()
 			faucet.close()
 			myresponse = "<p>Correct!</p><p>Your Bismuth will sent to you soon</p>"
-			os.remove("static/{}{}.png".format(currcaptcha,myip))
+			os.remove("static/{}{}.png".format(seed,myip))
 		
 		replot.append(str(myresponse))
 		replot.append('<p></p>')
 		replot.append('</td>\n')
 		replot.append('</tr></tbody></table>\n')
-		replot.append('<p>&copy; Copyright: Maccaspacca and HCLivess, 2017</p>')
+		replot.append('<p>&copy; Copyright: Maccaspacca and The Bismuth Foundation, 2018</p>')
 		replot.append('</center>\n')
 		replot.append('</body>\n')
 		replot.append('</html>')
@@ -480,9 +493,9 @@ def home_query():
 	else:
 
 		replot.append('<p></p>\n')
-		replot.append('<p><b>Too Many Visits - Come back later</b></p>\n')
+		replot.append('<p><b>Spam protection started, please come back later</b></p>\n')
 		replot.append('<p></p>\n')
-		replot.append('<p>&copy; Copyright: Maccaspacca and HCLivess, 2017</p>')
+		replot.append('<p>&copy; Copyright: Maccaspacca and The Bismuth Foundation, 2018</p>')
 		replot.append('</center>\n')
 		replot.append('</body>\n')
 		replot.append('</html>')
@@ -514,7 +527,7 @@ def links():
 	initial.append('<p></p>')
 	initial.append('<p><a href="{}" style="text-decoration:none;">Wallet Source</a></p>\n'.format(str(mylinks[2])))
 	initial.append('<p></p>')
-	initial.append('<p><a href="{}" style="text-decoration:none;">Bismuth Slack</a></p>\n'.format(str(mylinks[3])))
+	initial.append('<p><a href="{}" style="text-decoration:none;">Discord Channel</a></p>\n'.format(str(mylinks[3])))
 	initial.append('<p></p>')
 	initial.append('<p><a href="{}" style="text-decoration:none;">Explorer, ledger query, richlist and miner info</a></p>\n'.format(str(mylinks[4])))
 	initial.append('<p></p>')
@@ -524,7 +537,7 @@ def links():
 	initial.append('<p></p>')
 	initial.append('</td>\n')
 	initial.append('</tr></tbody></table>\n')
-	initial.append('<p>&copy; Copyright: Maccaspacca and HCLivess, 2017</p>')
+	initial.append('<p>&copy; Copyright: Maccaspacca and The Bismuth Foundation, 2018</p>')
 	initial.append('</center>\n')
 	initial.append('</body>\n')
 	initial.append('</html>')
@@ -534,10 +547,11 @@ def links():
 	return starter
 
 urls = (
-    '/', 'index'
+    '/', 'index',
+	'/links', 'links'
 )
 
 if __name__ == "__main__":
 	checkstart()
 	# insert other start procedures here
-	run(host='0.0.0.0', port=8183, debug=True)
+	run(host='0.0.0.0', port=faucet_port, debug=True)
